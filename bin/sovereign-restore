@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# sovereign-restore, decrypt and restore an age-encrypted sovereign-backup file.
+#
+# See README.md for design notes, SECURITY.md for the threat model.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly VERSION="0.1.0"
+readonly DEFAULT_LOCAL_DIR="${SOVEREIGN_BACKUP_LOCAL_DIR:-/data/backups}"
+readonly USB_MOUNTPOINT="${SOVEREIGN_BACKUP_USB_MOUNT:-/mnt/sov-backup}"
+readonly AGE_IDENTITY_FILE="${SOVEREIGN_BACKUP_IDENTITY:-/data/secrets/age/age-identity}"
+
+declare -i LIST_ONLY=0
+declare -i VERIFY_ONLY=0
+declare -i LATEST=0
+declare -i VERBOSE=0
+BACKUP_FILE=""
+TARGET_DIR=""
+
+if [[ -t 1 ]]; then
+    readonly C_RED=$'\e[31m'
+    readonly C_GREEN=$'\e[32m'
+    readonly C_YELLOW=$'\e[33m'
+    readonly C_BOLD=$'\e[1m'
+    readonly C_RESET=$'\e[0m'
+else
+    readonly C_RED="" C_GREEN="" C_YELLOW="" C_BOLD="" C_RESET=""
+fi
+
+log()  { printf '%(%H:%M:%S)T [INFO]  %s\n' -1 "$*"; }
+warn() { printf '%(%H:%M:%S)T [WARN]  %s%s%s\n' -1 "$C_YELLOW" "$*" "$C_RESET" >&2; }
+err()  { printf '%(%H:%M:%S)T [ERROR] %s%s%s\n' -1 "$C_RED" "$*" "$C_RESET" >&2; }
+dbg()  { (( VERBOSE )) && printf '%(%H:%M:%S)T [DEBUG] %s\n' -1 "$*" >&2 || true; }
+
+usage() {
+    cat <<EOF
+sovereign-restore $VERSION, decrypt + extract sovereign-backup archives
+
+Usage:
+  sovereign-restore --list
+  sovereign-restore --verify <backup-file>
+  sovereign-restore --latest [<target-dir>]
+  sovereign-restore <backup-file> [<target-dir>]
+
+Options:
+  --list                     Show all backups in $DEFAULT_LOCAL_DIR plus USB (if mounted), sorted by date
+  --verify <file>            Decrypt and tar-test, no extraction. Exit 0 if intact.
+  --latest [<target-dir>]    Restore the most recent backup in $DEFAULT_LOCAL_DIR
+  --verbose                  Debug-level logging
+  --version                  Print version
+  --help                     This help
+
+Default target-dir is /tmp/sovereign-restore-<timestamp> (safe).
+Target "/" requires interactive YES confirmation.
+
+age identity file: $AGE_IDENTITY_FILE
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --list)     LIST_ONLY=1 ;;
+            --verify)
+                [[ $# -ge 2 ]] || { err "--verify needs a file"; exit 2; }
+                VERIFY_ONLY=1
+                BACKUP_FILE="$2"
+                shift
+                ;;
+            --latest)   LATEST=1 ;;
+            --verbose)  VERBOSE=1 ;;
+            --version)  echo "sovereign-restore $VERSION"; exit 0 ;;
+            --help|-h)  usage; exit 0 ;;
+            -*)         err "unknown option: $1"; exit 2 ;;
+            *)
+                if [[ -z "$BACKUP_FILE" ]]; then
+                    BACKUP_FILE="$1"
+                elif [[ -z "$TARGET_DIR" ]]; then
+                    TARGET_DIR="$1"
+                else
+                    err "unexpected argument: $1"
+                    exit 2
+                fi
+                ;;
+        esac
+        shift
+    done
+}
+
+list_backups() {
+    local -a candidates=()
+    if [[ -d "$DEFAULT_LOCAL_DIR" ]]; then
+        while IFS= read -r f; do
+            candidates+=("local|$f")
+        done < <(find "$DEFAULT_LOCAL_DIR" -maxdepth 1 -name "sovereign-backup-*.age" 2>/dev/null)
+    fi
+    if mountpoint -q "$USB_MOUNTPOINT" 2>/dev/null; then
+        while IFS= read -r f; do
+            candidates+=("usb|$f")
+        done < <(find "$USB_MOUNTPOINT" -maxdepth 4 -name "sovereign-backup-*.age" 2>/dev/null)
+    fi
+
+    if (( ${#candidates[@]} == 0 )); then
+        echo "no backups found"
+        return 0
+    fi
+
+    # Sort by the timestamp embedded in the filename (YYYYMMDD-HHMMSS).
+    # Sort lexically: "sovereign-backup-<host>-<TS>" sorts by host first, then TS.
+    # That is OK for listing.
+    printf '%s\n' "${candidates[@]}" | sort | while IFS='|' read -r src f; do
+        local size mtime
+        size=$(du -h "$f" 2>/dev/null | cut -f1)
+        mtime=$(date -r "$f" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "?")
+        printf '  [%s] %s  %s  %s\n' "$src" "$mtime" "$size" "$f"
+    done
+}
+
+latest_backup() {
+    # Return the newest sovereign-backup-*.age in DEFAULT_LOCAL_DIR.
+    find "$DEFAULT_LOCAL_DIR" -maxdepth 1 -name "sovereign-backup-*.age" -printf '%T@ %p\n' 2>/dev/null \
+        | sort -nr \
+        | head -1 \
+        | awk '{print $2}'
+}
+
+# Pick the right tar flag for a given file extension.
+tar_decompress_flag() {
+    local f="$1"
+    case "$f" in
+        *.tar.zst.age) echo "--zstd" ;;
+        *.tar.gz.age)  echo "--gzip" ;;
+        *.tar.age)     echo "" ;;
+        *)             echo "--gzip" ;;  # legacy default
+    esac
+}
+
+verify_backup() {
+    local f="$1"
+    [[ -f "$f" ]] || { err "not found: $f"; return 1; }
+    [[ -r "$AGE_IDENTITY_FILE" ]] || { err "age identity unreadable: $AGE_IDENTITY_FILE"; return 1; }
+
+    local flag
+    flag=$(tar_decompress_flag "$f")
+
+    log "verifying $(basename "$f")"
+    if age --decrypt --identity "$AGE_IDENTITY_FILE" "$f" \
+        | tar --list $flag >/dev/null 2>&1; then
+        log "${C_GREEN}OK${C_RESET}: $(basename "$f") decrypted and tar-listed cleanly"
+        return 0
+    fi
+    err "verification failed for $(basename "$f")"
+    return 1
+}
+
+restore_backup() {
+    local f="$1" target="$2"
+    [[ -f "$f" ]] || { err "not found: $f"; return 1; }
+    [[ -r "$AGE_IDENTITY_FILE" ]] || { err "age identity unreadable: $AGE_IDENTITY_FILE"; return 1; }
+
+    if [[ "$target" == "/" ]]; then
+        warn "target is /, this WILL overwrite existing files."
+        printf 'Type YES to proceed: '
+        read -r confirm
+        [[ "$confirm" == "YES" ]] || { echo "aborted"; return 1; }
+    elif [[ -L "$target" ]]; then
+        err "target is a symlink, refusing: $target"
+        return 1
+    fi
+
+    mkdir -p "$target"
+    local flag
+    flag=$(tar_decompress_flag "$f")
+
+    log "restoring $(basename "$f") to $target"
+    if age --decrypt --identity "$AGE_IDENTITY_FILE" "$f" \
+        | tar --extract $flag --preserve-permissions --directory="$target"; then
+        log "${C_GREEN}restored${C_RESET} to $target"
+        echo ""
+        echo "Top-level contents:"
+        ls -la "$target" | head -20
+        return 0
+    fi
+    err "restore failed"
+    return 1
+}
+
+main() {
+    parse_args "$@"
+
+    if (( LIST_ONLY )); then
+        list_backups
+        exit 0
+    fi
+
+    if (( VERIFY_ONLY )); then
+        verify_backup "$BACKUP_FILE"
+        exit $?
+    fi
+
+    if (( LATEST )); then
+        local latest
+        latest=$(latest_backup)
+        if [[ -z "$latest" ]]; then
+            err "no backup found in $DEFAULT_LOCAL_DIR"
+            exit 1
+        fi
+        BACKUP_FILE="$latest"
+        log "latest backup: $BACKUP_FILE"
+    fi
+
+    if [[ -z "$BACKUP_FILE" ]]; then
+        usage
+        exit 2
+    fi
+
+    [[ -z "$TARGET_DIR" ]] && TARGET_DIR="/tmp/sovereign-restore-$(date +%s)"
+
+    restore_backup "$BACKUP_FILE" "$TARGET_DIR"
+}
+
+main "$@"

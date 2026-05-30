@@ -1,0 +1,39 @@
+# sovereign-backup config for Legi (Lenovo Legion Pro 7 Gen 10, AMD64)
+host: legi
+
+sources:
+  - /home/l3g10nary
+  - /data/webui
+  - /data/gitea
+  - /data/config/gitea
+  - /etc/composewarden.d
+  - /etc/watchdocker
+
+exclusions:
+  - "*/node_modules"
+  - "*/__pycache__"
+  - "*.pyc"
+  - "*/.docker-data/*"
+  - "*/.containerd/*"
+  - "*/.cache/*"
+  - "*/Videos"
+
+destinations:
+  local: /data/backups
+  usb_label: SOVEREIGN-BACKUP
+  usb_subdir: legi/backups
+
+retention:
+  local_days: 14
+  usb_days: 90
+
+age_recipient: /data/secrets/age/age-recipient
+
+compressor: auto
+
+pre_hook: ""
+post_hook: ""
+
+schedule:
+  local_calendar: "*-*-* 02:30:00"
+  local_random_delay: 30min

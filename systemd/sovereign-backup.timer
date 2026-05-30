@@ -1,0 +1,14 @@
+[Unit]
+Description=sovereign-backup daily timer
+Documentation=https://github.com/cipherfoxie/sovereign-backup
+
+[Timer]
+# Daily at 02:00 local time, with jitter to spread load when multiple
+# hosts run the same timer.
+OnCalendar=*-*-* 02:00:00
+RandomizedDelaySec=30min
+Persistent=true
+Unit=sovereign-backup.service
+
+[Install]
+WantedBy=timers.target

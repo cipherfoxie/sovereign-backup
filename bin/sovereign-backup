@@ -1,0 +1,714 @@
+#!/usr/bin/env bash
+# sovereign-backup, multi-host age-encrypted backup tool.
+# Pure bash, zero runtime deps beyond age + tar + a compressor.
+#
+# See README.md for design constraints and SECURITY.md for the threat model.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly VERSION="0.1.0"
+readonly DEFAULT_CONFIG_DIR="${SOVEREIGN_BACKUP_CONFIG_DIR:-/etc/sovereign-backup}"
+readonly LOCKDIR="${SOVEREIGN_BACKUP_LOCKDIR:-/run/sovereign-backup/lock}"
+readonly USB_MOUNTPOINT="${SOVEREIGN_BACKUP_USB_MOUNT:-/mnt/sov-backup}"
+readonly LOG_FILE="${SOVEREIGN_BACKUP_LOG:-/var/log/sovereign-backup.log}"
+
+# ── State (writable) ──────────────────────────────────────────────────────
+declare -i DRY_RUN=0
+declare -i VERBOSE=0
+declare -i FORCE_ONCE=0
+declare -i LIST_ONLY=0
+CONFIG=""
+TARGET="local"   # local | usb | both
+HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname)"
+
+# Loaded from config
+CFG_HOST=""
+declare -a CFG_SOURCES=()
+declare -a CFG_EXCLUSIONS=()
+CFG_LOCAL_DEST=""
+CFG_USB_LABEL=""
+CFG_USB_SUBDIR=""
+declare -i CFG_RETENTION_LOCAL=14
+declare -i CFG_RETENTION_USB=90
+CFG_AGE_RECIPIENT_FILE=""
+CFG_PRE_HOOK=""
+CFG_POST_HOOK=""
+CFG_COMPRESSOR=""   # auto | gzip | pigz | zstd; empty = auto
+
+# Stats
+declare -i STATS_WRITTEN=0
+declare -i STATS_PRUNED=0
+STATS_LAST_FILE=""
+STATS_LAST_SIZE=""
+
+# ── ANSI colors (only when stdout is a TTY) ───────────────────────────────
+if [[ -t 1 ]]; then
+    readonly C_RED=$'\e[31m'
+    readonly C_GREEN=$'\e[32m'
+    readonly C_YELLOW=$'\e[33m'
+    readonly C_BLUE=$'\e[34m'
+    readonly C_BOLD=$'\e[1m'
+    readonly C_RESET=$'\e[0m'
+else
+    readonly C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_BOLD="" C_RESET=""
+fi
+
+# ── Logging ───────────────────────────────────────────────────────────────
+_log_to_file() {
+    [[ -n "$LOG_FILE" ]] || return 0
+    # Best-effort append. Failure (e.g. running as non-root) is ignored.
+    printf '%(%Y-%m-%d %H:%M:%S)T %s\n' -1 "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+log()  { printf '%(%H:%M:%S)T [INFO]  %s\n' -1 "$*"; _log_to_file "[INFO]  $*"; }
+warn() { printf '%(%H:%M:%S)T [WARN]  %s%s%s\n' -1 "$C_YELLOW" "$*" "$C_RESET" >&2; _log_to_file "[WARN]  $*"; }
+err()  { printf '%(%H:%M:%S)T [ERROR] %s%s%s\n' -1 "$C_RED" "$*" "$C_RESET" >&2; _log_to_file "[ERROR] $*"; }
+dbg()  { (( VERBOSE )) && printf '%(%H:%M:%S)T [DEBUG] %s\n' -1 "$*" >&2 || true; }
+
+# ── Fatal-error trap ──────────────────────────────────────────────────────
+declare -a CLEANUP_FILES=()
+on_error() {
+    local exit_code=$? line_no=${1:-?}
+    err "unexpected exit at line $line_no (code $exit_code)"
+    cleanup
+    exit "$exit_code"
+}
+cleanup() {
+    local f
+    for f in "${CLEANUP_FILES[@]:-}"; do
+        [[ -n "$f" && -f "$f" ]] && rm -f "$f" 2>/dev/null || true
+    done
+    [[ -d "$LOCKDIR" ]] && rmdir "$LOCKDIR" 2>/dev/null || true
+}
+trap 'on_error $LINENO' ERR
+trap cleanup EXIT INT TERM
+
+# ── Usage ─────────────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+sovereign-backup $VERSION, multi-host age-encrypted backup tool
+
+Usage: sovereign-backup [OPTIONS]
+
+Options:
+  --dry-run           Print plan, do not tar, encrypt, or write
+  --once              Run even if another instance is detected
+  --verbose           Debug-level logging
+  --config <path>     Use specific config file (overrides hostname autodetect)
+  --target <where>    Write to: local (default), usb, both
+  --list              List configured sources and exit
+  --version           Print version, exit
+  --help              This help
+
+Config autodetect:
+  Looks for ${DEFAULT_CONFIG_DIR}/<hostname>.yaml (hostname=${HOSTNAME_SHORT})
+  Then falls back to ${DEFAULT_CONFIG_DIR}/config.yaml
+
+USB:
+  When --target is usb or both, looks for /dev/disk/by-label/<usb_label>,
+  mounts at ${USB_MOUNTPOINT} if not already mounted, writes the backup,
+  then unmounts (only if we mounted it ourselves).
+
+Exit codes:
+  0   success
+  1   backup error (tar, encrypt, write)
+  2   config or argument error
+  10  another instance is running (use --once to override)
+EOF
+}
+
+# ── CLI parsing ───────────────────────────────────────────────────────────
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)  DRY_RUN=1 ;;
+            --once)     FORCE_ONCE=1 ;;
+            --verbose)  VERBOSE=1 ;;
+            --list)     LIST_ONLY=1 ;;
+            --config)
+                [[ $# -ge 2 ]] || { err "--config needs a path"; exit 2; }
+                CONFIG="$2"
+                shift
+                ;;
+            --target)
+                [[ $# -ge 2 ]] || { err "--target needs an argument"; exit 2; }
+                case "$2" in
+                    local|usb|both) TARGET="$2" ;;
+                    *) err "--target must be one of: local, usb, both"; exit 2 ;;
+                esac
+                shift
+                ;;
+            --version)  echo "sovereign-backup $VERSION"; exit 0 ;;
+            --help|-h)  usage; exit 0 ;;
+            -*)         err "unknown option: $1"; usage >&2; exit 2 ;;
+            *)          err "unexpected argument: $1"; exit 2 ;;
+        esac
+        shift
+    done
+}
+
+# ── Atomic lock via mkdir ─────────────────────────────────────────────────
+acquire_lock() {
+    mkdir -p "$(dirname "$LOCKDIR")" 2>/dev/null || true
+    if mkdir "$LOCKDIR" 2>/dev/null; then
+        printf '%d\n' "$$" > "$LOCKDIR/pid"
+        dbg "lock acquired ($LOCKDIR)"
+        return 0
+    fi
+
+    local holder
+    if [[ -r "$LOCKDIR/pid" ]] && holder=$(<"$LOCKDIR/pid") && [[ "$holder" =~ ^[0-9]+$ ]]; then
+        if kill -0 "$holder" 2>/dev/null; then
+            err "another instance is running (pid $holder). use --once to override."
+            return 10
+        fi
+        warn "stale lock from pid $holder, breaking"
+    else
+        warn "lock dir exists but pid file is unreadable, breaking"
+    fi
+    rm -rf "$LOCKDIR"
+    mkdir "$LOCKDIR"
+    printf '%d\n' "$$" > "$LOCKDIR/pid"
+    return 0
+}
+
+# ── Hook-path validation ──────────────────────────────────────────────────
+validate_hook() {
+    local hook="$1" kind="$2"
+
+    [[ -z "$hook" ]] && return 0
+
+    if [[ "$hook" != /* ]]; then
+        err "$kind path must be absolute: $hook"
+        return 2
+    fi
+    if [[ "$hook" == *".."* ]]; then
+        err "$kind path contains '..': $hook"
+        return 2
+    fi
+    if [[ ! -f "$hook" ]]; then
+        err "$kind not a regular file: $hook"
+        return 2
+    fi
+    if [[ ! -x "$hook" ]]; then
+        err "$kind not executable: $hook"
+        return 2
+    fi
+    if [[ $EUID -eq 0 ]]; then
+        local owner
+        owner=$(stat -c '%U' "$hook" 2>/dev/null || echo "?")
+        if [[ "$owner" != "root" ]]; then
+            err "$kind not owned by root (got: $owner): $hook"
+            return 2
+        fi
+    fi
+    return 0
+}
+
+# ── YAML parser ───────────────────────────────────────────────────────────
+# Minimal subset: top-level scalars + lists, nested two-level sections
+# (destinations.*, retention.*, schedule.*). Quoted strings preserve '#'.
+load_config() {
+    if [[ -z "$CONFIG" ]]; then
+        if [[ -f "$DEFAULT_CONFIG_DIR/$HOSTNAME_SHORT.yaml" ]]; then
+            CONFIG="$DEFAULT_CONFIG_DIR/$HOSTNAME_SHORT.yaml"
+        elif [[ -f "$DEFAULT_CONFIG_DIR/config.yaml" ]]; then
+            CONFIG="$DEFAULT_CONFIG_DIR/config.yaml"
+        fi
+    fi
+
+    if [[ -z "$CONFIG" || ! -f "$CONFIG" ]]; then
+        warn "config not found (looked for $DEFAULT_CONFIG_DIR/$HOSTNAME_SHORT.yaml), using defaults"
+        return 0
+    fi
+    if [[ ! -r "$CONFIG" ]]; then
+        err "config not readable: $CONFIG"
+        return 2
+    fi
+    dbg "loading config: $CONFIG"
+
+    local section="" raw line key val
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        raw="${raw%$'\r'}"
+        line="$(_strip_comment "$raw")"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+
+        case "$line" in
+            sources:)         section="sources";       continue ;;
+            exclusions:)      section="exclusions";    continue ;;
+            destinations:)    section="destinations";  continue ;;
+            retention:)       section="retention";     continue ;;
+            schedule:)        section="schedule";      continue ;;
+        esac
+
+        if [[ "$line" == "-"* && -n "$section" ]]; then
+            val="${line#-}"
+            val="${val#"${val%%[![:space:]]*}"}"
+            val="$(_unquote "$val")"
+            case "$section" in
+                sources)     CFG_SOURCES+=("$val") ;;
+                exclusions)  CFG_EXCLUSIONS+=("$val") ;;
+                *)           warn "list item under '$section': $val (ignored)" ;;
+            esac
+            continue
+        fi
+
+        if [[ "$line" == *":"* ]]; then
+            key="${line%%:*}"
+            val="${line#*:}"
+            val="${val#"${val%%[![:space:]]*}"}"
+            val="$(_unquote "$val")"
+
+            case "$key" in
+                host)            CFG_HOST="$val"; section="" ;;
+                age_recipient)   CFG_AGE_RECIPIENT_FILE="$val"; section="" ;;
+                pre_hook)        CFG_PRE_HOOK="$val"; section="" ;;
+                post_hook)       CFG_POST_HOOK="$val"; section="" ;;
+                compressor)      CFG_COMPRESSOR="$val"; section="" ;;
+                local)
+                    if [[ "$section" == "destinations" ]]; then
+                        CFG_LOCAL_DEST="$val"
+                    fi
+                    ;;
+                usb_label)
+                    if [[ "$section" == "destinations" ]]; then
+                        CFG_USB_LABEL="$val"
+                    fi
+                    ;;
+                usb_subdir)
+                    if [[ "$section" == "destinations" ]]; then
+                        CFG_USB_SUBDIR="$val"
+                    fi
+                    ;;
+                local_days)
+                    if [[ "$section" == "retention" ]]; then
+                        [[ "$val" =~ ^[0-9]+$ ]] && CFG_RETENTION_LOCAL="$val"
+                    fi
+                    ;;
+                usb_days)
+                    if [[ "$section" == "retention" ]]; then
+                        [[ "$val" =~ ^[0-9]+$ ]] && CFG_RETENTION_USB="$val"
+                    fi
+                    ;;
+                local_calendar|local_random_delay)
+                    # systemd-timer hints, informational only
+                    :
+                    ;;
+                *)
+                    dbg "config: ignored key '$key' under section '${section:-<top>}'"
+                    ;;
+            esac
+            continue
+        fi
+
+        warn "config: unparseable line: $raw"
+    done < "$CONFIG"
+
+    dbg "config loaded: host=$CFG_HOST sources=${#CFG_SOURCES[@]} exclusions=${#CFG_EXCLUSIONS[@]}"
+}
+
+# Strip trailing '# comment', preserve '#' inside "..." or '...'.
+_strip_comment() {
+    local s="$1"
+    local in_dq=0 in_sq=0 out="" i ch
+    for (( i=0; i<${#s}; i++ )); do
+        ch="${s:i:1}"
+        if [[ "$ch" == '"' && $in_sq -eq 0 ]]; then
+            in_dq=$((1 - in_dq))
+        elif [[ "$ch" == "'" && $in_dq -eq 0 ]]; then
+            in_sq=$((1 - in_sq))
+        elif [[ "$ch" == "#" && $in_dq -eq 0 && $in_sq -eq 0 ]]; then
+            break
+        fi
+        out+="$ch"
+    done
+    printf '%s' "$out"
+}
+
+# Remove surrounding "..." or '...'.
+_unquote() {
+    local s="$1"
+    if [[ "$s" == \"*\" && ${#s} -ge 2 ]]; then
+        s="${s:1:-1}"
+    elif [[ "$s" == \'*\' && ${#s} -ge 2 ]]; then
+        s="${s:1:-1}"
+    fi
+    printf '%s' "$s"
+}
+
+# ── Validate config + environment ─────────────────────────────────────────
+validate_config() {
+    # age binary
+    if ! command -v age >/dev/null 2>&1; then
+        err "age binary not found in PATH. Install with: apt install age"
+        return 2
+    fi
+
+    # recipient file
+    if [[ -z "$CFG_AGE_RECIPIENT_FILE" ]]; then
+        err "age_recipient not configured"
+        return 2
+    fi
+    if [[ ! -f "$CFG_AGE_RECIPIENT_FILE" ]]; then
+        err "age recipient file not found: $CFG_AGE_RECIPIENT_FILE"
+        return 2
+    fi
+    if [[ ! -r "$CFG_AGE_RECIPIENT_FILE" ]]; then
+        err "age recipient file not readable: $CFG_AGE_RECIPIENT_FILE"
+        return 2
+    fi
+    # The first non-comment, non-blank line must look like an age recipient
+    local rec
+    rec=$(grep -E -v '^[[:space:]]*(#|$)' "$CFG_AGE_RECIPIENT_FILE" | head -1)
+    if [[ -z "$rec" ]]; then
+        err "age recipient file is empty: $CFG_AGE_RECIPIENT_FILE"
+        return 2
+    fi
+    if [[ ! "$rec" =~ ^age1[0-9a-z]+$ ]] && [[ ! "$rec" =~ ^ssh- ]]; then
+        err "age recipient does not look valid: $rec"
+        return 2
+    fi
+
+    # local destination
+    if [[ "$TARGET" == "local" || "$TARGET" == "both" ]]; then
+        if [[ -z "$CFG_LOCAL_DEST" ]]; then
+            err "destinations.local not configured"
+            return 2
+        fi
+    fi
+
+    # usb destination
+    if [[ "$TARGET" == "usb" || "$TARGET" == "both" ]]; then
+        if [[ -z "$CFG_USB_LABEL" ]]; then
+            err "destinations.usb_label not configured (required for --target $TARGET)"
+            return 2
+        fi
+        if [[ -z "$CFG_USB_SUBDIR" ]]; then
+            err "destinations.usb_subdir not configured"
+            return 2
+        fi
+    fi
+
+    return 0
+}
+
+# ── Compressor selection ──────────────────────────────────────────────────
+pick_compressor() {
+    # Returns the command to use as a single space-separated string.
+    case "$CFG_COMPRESSOR" in
+        zstd)  echo "zstd -c -T0 -3" ;;
+        pigz)  echo "pigz -c" ;;
+        gzip)  echo "gzip -c" ;;
+        auto|"")
+            if command -v zstd >/dev/null 2>&1; then echo "zstd -c -T0 -3"
+            elif command -v pigz >/dev/null 2>&1; then echo "pigz -c"
+            else echo "gzip -c"
+            fi
+            ;;
+        *)
+            warn "unknown compressor '$CFG_COMPRESSOR', falling back to gzip"
+            echo "gzip -c"
+            ;;
+    esac
+}
+
+# Extension matching the chosen compressor (for filename naming).
+compressor_ext() {
+    local cmd="$1"
+    case "$cmd" in
+        zstd*) echo "tar.zst" ;;
+        *)     echo "tar.gz" ;;
+    esac
+}
+
+# ── USB mount helpers ─────────────────────────────────────────────────────
+USB_WAS_MOUNTED_BY_US=0
+
+usb_mount_if_needed() {
+    local label="$1"
+    local dev="/dev/disk/by-label/$label"
+
+    if [[ ! -e "$dev" ]]; then
+        err "USB device not found: $dev (stick not inserted?)"
+        return 1
+    fi
+
+    if mountpoint -q "$USB_MOUNTPOINT" 2>/dev/null; then
+        dbg "USB already mounted at $USB_MOUNTPOINT"
+        USB_WAS_MOUNTED_BY_US=0
+        return 0
+    fi
+
+    mkdir -p "$USB_MOUNTPOINT"
+    if mount "$dev" "$USB_MOUNTPOINT" 2>/dev/null; then
+        USB_WAS_MOUNTED_BY_US=1
+        dbg "USB mounted at $USB_MOUNTPOINT"
+        return 0
+    fi
+    err "failed to mount $dev at $USB_MOUNTPOINT"
+    return 1
+}
+
+usb_unmount_if_we_mounted() {
+    if (( USB_WAS_MOUNTED_BY_US )); then
+        sync
+        if umount "$USB_MOUNTPOINT" 2>/dev/null; then
+            dbg "USB unmounted"
+        else
+            warn "umount $USB_MOUNTPOINT failed (check 'lsof | grep $USB_MOUNTPOINT')"
+        fi
+        USB_WAS_MOUNTED_BY_US=0
+    fi
+}
+
+# ── Source validation (warn missing, drop, keep going) ────────────────────
+filter_valid_sources() {
+    local s
+    local -a valid=()
+    for s in "${CFG_SOURCES[@]:-}"; do
+        if [[ -d "$s" || -f "$s" ]]; then
+            if [[ -L "$s" ]]; then
+                warn "source is a symlink, skipping: $s"
+                continue
+            fi
+            valid+=("$s")
+        else
+            warn "source not found, skipping: $s"
+        fi
+    done
+    if (( ${#valid[@]} == 0 )); then
+        err "no valid sources to back up"
+        return 1
+    fi
+    CFG_SOURCES=("${valid[@]}")
+    return 0
+}
+
+# ── Build the tar+compress+age pipeline ───────────────────────────────────
+# Args: 1=destination-file
+do_backup_to() {
+    local dest_file="$1"
+    local dest_dir
+    dest_dir=$(dirname "$dest_file")
+
+    mkdir -p "$dest_dir"
+    chmod 700 "$dest_dir" 2>/dev/null || true
+
+    local tmp_file="${dest_file}.tmp"
+    CLEANUP_FILES+=("$tmp_file")
+
+    # Build exclude args
+    local -a tar_excludes=()
+    local e
+    for e in "${CFG_EXCLUSIONS[@]:-}"; do
+        tar_excludes+=("--exclude=$e")
+    done
+
+    # Sources are passed relative to / so the archive can be safely
+    # extracted under any target directory without absolute-path leaks.
+    local -a sources_rel=()
+    local s
+    for s in "${CFG_SOURCES[@]}"; do
+        sources_rel+=("${s#/}")
+    done
+
+    local compressor
+    compressor=$(pick_compressor)
+    local recipient
+    recipient=$(grep -E -v '^[[:space:]]*(#|$)' "$CFG_AGE_RECIPIENT_FILE" | head -1)
+
+    dbg "tar excludes: ${tar_excludes[*]:-<none>}"
+    dbg "compressor:   $compressor"
+    dbg "recipient:    $recipient"
+    dbg "sources:      ${sources_rel[*]}"
+    dbg "destination:  $dest_file"
+
+    # shellcheck disable=SC2086
+    if ! tar --create \
+            --preserve-permissions \
+            "${tar_excludes[@]}" \
+            --directory=/ \
+            "${sources_rel[@]}" \
+        | $compressor \
+        | age --recipient "$recipient" --output "$tmp_file"; then
+        err "backup pipeline failed for $dest_file"
+        return 1
+    fi
+
+    if [[ ! -s "$tmp_file" ]]; then
+        err "produced tmp file is empty: $tmp_file"
+        return 1
+    fi
+
+    mv "$tmp_file" "$dest_file"
+    chmod 600 "$dest_file" 2>/dev/null || true
+    # Successful: drop from cleanup list so EXIT trap leaves it alone.
+    local i
+    for i in "${!CLEANUP_FILES[@]}"; do
+        [[ "${CLEANUP_FILES[$i]}" == "$tmp_file" ]] && unset 'CLEANUP_FILES[i]'
+    done
+
+    STATS_LAST_FILE="$dest_file"
+    STATS_LAST_SIZE=$(du -h "$dest_file" 2>/dev/null | cut -f1)
+    STATS_WRITTEN=$((STATS_WRITTEN + 1))
+    log "${C_GREEN}wrote${C_RESET} $(basename "$dest_file") ($STATS_LAST_SIZE)"
+    return 0
+}
+
+# ── Retention pruning ─────────────────────────────────────────────────────
+prune_dir() {
+    local dir="$1" days="$2" prefix="$3"
+    [[ -d "$dir" ]] || return 0
+    (( days > 0 )) || return 0
+
+    local before after
+    before=$(find "$dir" -maxdepth 1 -name "${prefix}*.age" 2>/dev/null | wc -l)
+
+    if (( DRY_RUN )); then
+        local would
+        would=$(find "$dir" -maxdepth 1 -name "${prefix}*.age" -mtime "+$days" 2>/dev/null | wc -l)
+        log "  dry-run: would prune $would file(s) older than $days days in $dir"
+        return 0
+    fi
+
+    find "$dir" -maxdepth 1 -name "${prefix}*.age" -mtime "+$days" -delete 2>/dev/null || true
+    after=$(find "$dir" -maxdepth 1 -name "${prefix}*.age" 2>/dev/null | wc -l)
+    local pruned=$(( before - after ))
+    if (( pruned > 0 )); then
+        log "  pruned $pruned old backup(s) (kept $after) in $dir"
+        STATS_PRUNED=$(( STATS_PRUNED + pruned ))
+    fi
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────
+main() {
+    parse_args "$@"
+
+    if (( FORCE_ONCE == 0 )); then
+        acquire_lock || exit $?
+    fi
+
+    load_config || exit $?
+
+    # Default destinations when not set
+    [[ -z "$CFG_LOCAL_DEST" ]] && CFG_LOCAL_DEST="/data/backups"
+
+    if (( LIST_ONLY )); then
+        echo "host:          ${CFG_HOST:-$HOSTNAME_SHORT}"
+        echo "config:        ${CONFIG:-<none>}"
+        echo "target:        $TARGET"
+        echo "local dest:    $CFG_LOCAL_DEST"
+        echo "usb label:     ${CFG_USB_LABEL:-<unset>}"
+        echo "usb subdir:    ${CFG_USB_SUBDIR:-<unset>}"
+        echo "retention:     local=${CFG_RETENTION_LOCAL}d usb=${CFG_RETENTION_USB}d"
+        echo "age recipient: ${CFG_AGE_RECIPIENT_FILE:-<unset>}"
+        echo "compressor:    ${CFG_COMPRESSOR:-auto}"
+        echo "pre_hook:      ${CFG_PRE_HOOK:-<none>}"
+        echo "post_hook:     ${CFG_POST_HOOK:-<none>}"
+        echo ""
+        echo "sources (${#CFG_SOURCES[@]}):"
+        local s
+        for s in "${CFG_SOURCES[@]:-}"; do
+            printf '  - %s\n' "$s"
+        done
+        echo "exclusions (${#CFG_EXCLUSIONS[@]}):"
+        for s in "${CFG_EXCLUSIONS[@]:-}"; do
+            printf '  - %s\n' "$s"
+        done
+        exit 0
+    fi
+
+    validate_config || exit $?
+    validate_hook "$CFG_PRE_HOOK"  "pre_hook"  || exit 2
+    validate_hook "$CFG_POST_HOOK" "post_hook" || exit 2
+
+    if (( ${#CFG_SOURCES[@]} == 0 )); then
+        err "no sources defined in config"
+        exit 2
+    fi
+
+    log "${C_BOLD}sovereign-backup $VERSION${C_RESET}, host=${CFG_HOST:-$HOSTNAME_SHORT}, target=$TARGET"
+    (( DRY_RUN )) && log "${C_YELLOW}DRY-RUN MODE${C_RESET}"
+
+    filter_valid_sources || exit 1
+
+    if (( DRY_RUN )); then
+        log "would archive sources (relative to /):"
+        for s in "${CFG_SOURCES[@]}"; do
+            printf '    %s\n' "${s#/}"
+        done
+        log "would write to:"
+        [[ "$TARGET" == "local" || "$TARGET" == "both" ]] && log "    local: $CFG_LOCAL_DEST"
+        [[ "$TARGET" == "usb"   || "$TARGET" == "both" ]] && log "    usb:   $USB_MOUNTPOINT/$CFG_USB_SUBDIR"
+        log "compressor would be: $(pick_compressor)"
+        log "would run pre_hook:  ${CFG_PRE_HOOK:-<none>}"
+        log "would run post_hook: ${CFG_POST_HOOK:-<none>}"
+        exit 0
+    fi
+
+    # pre_hook
+    if [[ -n "$CFG_PRE_HOOK" ]]; then
+        log "▸ pre_hook: $CFG_PRE_HOOK"
+        if ! "$CFG_PRE_HOOK"; then
+            warn "pre_hook returned non-zero, continuing"
+        fi
+    fi
+
+    local timestamp host ext
+    timestamp=$(date +"%Y%m%d-%H%M%S")
+    host="${CFG_HOST:-$HOSTNAME_SHORT}"
+    ext=$(compressor_ext "$(pick_compressor)")
+    local prefix="sovereign-backup-${host}-"
+    local filename="${prefix}${timestamp}.${ext}.age"
+
+    local local_ok=1 usb_ok=1
+
+    if [[ "$TARGET" == "local" || "$TARGET" == "both" ]]; then
+        log "▸ writing local backup"
+        if ! do_backup_to "$CFG_LOCAL_DEST/$filename"; then
+            err "local backup failed"
+            local_ok=0
+        else
+            prune_dir "$CFG_LOCAL_DEST" "$CFG_RETENTION_LOCAL" "$prefix"
+        fi
+    fi
+
+    if [[ "$TARGET" == "usb" || "$TARGET" == "both" ]]; then
+        log "▸ writing USB backup (label=$CFG_USB_LABEL)"
+        if usb_mount_if_needed "$CFG_USB_LABEL"; then
+            local usb_dest="$USB_MOUNTPOINT/$CFG_USB_SUBDIR"
+            if ! do_backup_to "$usb_dest/$filename"; then
+                err "USB backup failed"
+                usb_ok=0
+            else
+                prune_dir "$usb_dest" "$CFG_RETENTION_USB" "$prefix"
+            fi
+            usb_unmount_if_we_mounted
+        else
+            err "USB backup skipped, mount failed"
+            usb_ok=0
+        fi
+    fi
+
+    # post_hook (only if at least one destination wrote successfully)
+    if [[ -n "$CFG_POST_HOOK" ]] && (( STATS_WRITTEN > 0 )); then
+        log "▸ post_hook: $CFG_POST_HOOK"
+        if ! "$CFG_POST_HOOK"; then
+            warn "post_hook returned non-zero"
+        fi
+    fi
+
+    log "${C_BOLD}═══ Summary ═══${C_RESET}"
+    log "  written:     $STATS_WRITTEN"
+    log "  pruned:      $STATS_PRUNED"
+    [[ -n "$STATS_LAST_FILE" ]] && log "  last file:   $(basename "$STATS_LAST_FILE") ($STATS_LAST_SIZE)"
+
+    if (( local_ok == 0 || usb_ok == 0 )); then
+        exit 1
+    fi
+    exit 0
+}
+
+main "$@"

@@ -1,0 +1,59 @@
+[Unit]
+Description=sovereign-backup, age-encrypted local backup
+Documentation=https://github.com/cipherfoxie/sovereign-backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sovereign-backup --target local
+Nice=15
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=2h
+
+# ── Sandboxing ───────────────────────────────────────────────────────────
+# The script needs:
+#   read access to source paths (often /data, /etc, /home/<user>)
+#   write access to local destination (/data/backups)
+#   write access to /run/sovereign-backup (lock)
+#   write access to /var/log/sovereign-backup.log
+#   exec access to /usr/local/bin/age
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+PrivateTmp=true
+PrivateDevices=true
+RemoveIPC=true
+
+RuntimeDirectory=sovereign-backup
+RuntimeDirectoryMode=0750
+
+# Adjust ReadWritePaths to match your host's destination layout. The
+# defaults below cover Sparki/Legi/Floki. Add more for custom paths.
+ReadWritePaths=/data/backups /run/sovereign-backup /var/log
+
+# Network: pre_hook may need it (Floki pull, Nostr notify, etc).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @debug @cpu-emulation @obsolete @raw-io @reboot @swap
+
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target

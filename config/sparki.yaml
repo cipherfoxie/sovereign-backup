@@ -1,0 +1,41 @@
+# sovereign-backup config for Sparki (DGX Spark, ARM64)
+host: sparki
+
+sources:
+  - /data/config
+  - /data/scripts
+  - /data/secrets
+  - /data/gitea
+  - /data/webui
+  - /data/projects
+  - /data/matrix
+  - /data/backups/floki-snapshot
+
+exclusions:
+  - "*/node_modules"
+  - "*/__pycache__"
+  - "*.pyc"
+  - "*/.aider.tags.cache*"
+  - "*/sovereign-blog/dist"
+  - "*/sovereign-blog/.astro"
+  - "*/.git/objects/pack"
+
+destinations:
+  local: /data/backups
+  usb_label: SOVEREIGN-BACKUP
+  usb_subdir: sparki/backups
+
+retention:
+  local_days: 14
+  usb_days: 90
+
+age_recipient: /data/secrets/age/age-recipient
+
+compressor: auto
+
+pre_hook: ""
+post_hook: ""
+
+schedule:
+  local_calendar: "*-*-* 02:00:00"
+  local_random_delay: 30min

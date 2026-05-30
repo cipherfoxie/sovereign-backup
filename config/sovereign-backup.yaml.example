@@ -1,0 +1,60 @@
+# sovereign-backup config, annotated example
+#
+# Copy to /etc/sovereign-backup/<hostname>.yaml  (sovereign-backup
+# autodetects by `hostname -s`) or pass via `--config <path>`.
+#
+# All fields are optional except `sources`, `destinations.local` (when
+# target includes local), `destinations.usb_label` + `usb_subdir` (when
+# target includes usb), and `age_recipient`.
+
+# Friendly host identifier. Appears in the filename and the log.
+# If empty, falls back to `hostname -s`.
+host: examplehost
+
+# Files and directories to include. Each path is archived relative to /,
+# so /data/foo lands in the tar as "data/foo". Missing paths produce a
+# warning and are skipped (the run does not abort).
+sources:
+  - /etc
+  - /home/user/notes
+  - /var/lib/myapp
+
+# Tar exclude patterns. Standard shell glob, matched against the full
+# path within the archive. Quote any pattern containing '#'.
+exclusions:
+  - "*/node_modules"
+  - "*/__pycache__"
+  - "*.pyc"
+  - "*/.cache/*"
+  - "*/.git/objects/pack"
+
+# Destinations: local is always a local path. usb_label is matched against
+# /dev/disk/by-label/<label> and mounted at /mnt/sov-backup on demand.
+destinations:
+  local: /data/backups
+  usb_label: SOVEREIGN-BACKUP
+  usb_subdir: examplehost/backups
+
+# Retention in days. 0 disables prune for that target.
+retention:
+  local_days: 14
+  usb_days: 90
+
+# Path to a file holding the age recipient (the PUBLIC key, age1...).
+# Multiple lines allowed; first non-comment, non-blank line is used.
+age_recipient: /etc/sovereign-backup/age-recipient
+
+# Optional compressor override: auto (default), gzip, pigz, zstd.
+# auto picks the best available in PATH: zstd > pigz > gzip.
+compressor: auto
+
+# Optional hooks. Must be absolute paths, root-owned, executable.
+# pre_hook runs before tar (use to pause services, snapshot DB, etc).
+# post_hook runs only after at least one destination wrote successfully.
+pre_hook: ""
+post_hook: ""
+
+# systemd timer hints, consumed by the install script only.
+schedule:
+  local_calendar: "*-*-* 02:00:00"
+  local_random_delay: 30min
