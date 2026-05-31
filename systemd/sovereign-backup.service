@@ -52,8 +52,8 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @debug @cpu-emulation @obsolete @raw-io @reboot @swap
 
-CapabilityBoundingSet=CAP_DAC_READ_SEARCH
-AmbientCapabilities=CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
 
 [Install]
 WantedBy=multi-user.target

@@ -525,13 +525,15 @@ do_backup_to() {
     dbg "sources:      ${sources_rel[*]}"
     dbg "destination:  $dest_file"
 
-    # shellcheck disable=SC2086
+    # $compressor holds a command with args ("zstd -c -T0 -3"). A bare
+    # `| $compressor` makes bash search for a binary literally named with
+    # the spaces. bash -c "$compressor" splits the args correctly.
     if ! tar --create \
             --preserve-permissions \
             "${tar_excludes[@]}" \
             --directory=/ \
             "${sources_rel[@]}" \
-        | $compressor \
+        | bash -c "$compressor" \
         | age --recipient "$recipient" --output "$tmp_file"; then
         err "backup pipeline failed for $dest_file"
         return 1
