@@ -9,6 +9,7 @@
 [![arch](https://img.shields.io/badge/arch-amd64%20%7C%20arm64-blue.svg)](#tested-on)
 [![Zero Dependencies](https://img.shields.io/badge/runtime%20deps-bash%20%2B%20age%20%2B%20tar-success.svg)](#design-constraints)
 [![Security](https://img.shields.io/badge/security-SECURITY.md-red.svg)](SECURITY.md)
+[![Write-up](https://img.shields.io/badge/write--up-sovgrid.org-76b900.svg)](https://sovgrid.org/blog/strategy-backup-and-disaster-recovery/)
 
 ## What
 
