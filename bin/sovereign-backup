@@ -51,6 +51,7 @@ if [[ -t 1 ]]; then
     readonly C_BOLD=$'\e[1m'
     readonly C_RESET=$'\e[0m'
 else
+    # shellcheck disable=SC2034  # full palette kept for hook scripts
     readonly C_RED="" C_GREEN="" C_YELLOW="" C_BLUE="" C_BOLD="" C_RESET=""
 fi
 

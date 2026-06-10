@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: shellcheck + smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck (severity warning)
+        run: shellcheck --severity=warning bin/sovereign-backup bin/sovereign-restore install.sh tests/smoke.sh
+
+      - name: Bash syntax
+        run: |
+          bash -n bin/sovereign-backup
+          bash -n bin/sovereign-restore
+          bash -n install.sh
+          bash -n tests/smoke.sh
+
+      - name: Smoke tests
+        run: bash tests/smoke.sh
